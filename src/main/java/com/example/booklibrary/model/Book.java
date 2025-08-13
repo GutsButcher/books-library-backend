@@ -3,6 +3,7 @@ package com.example.booklibrary.model;
 import jakarta.persistence.*;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 import java.time.LocalDate;
@@ -25,6 +26,7 @@ public class Book {
     private String author;
 
     @NotBlank(message = "ISBN is required")
+    @Pattern(regexp = "^(97[89])?\\d{9}[\\dX]$", message = "Invalid ISBN format")
     @Size(max = 20)
     @Column(unique = true, nullable = false)
     private String isbn;
