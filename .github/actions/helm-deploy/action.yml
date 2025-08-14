@@ -31,6 +31,10 @@ runs:
     - name: update helm repos
       shell: bash
       run: helm repo update
+    - name: Build helm dependencies
+      shell: bash
+      working-directory: ./helm/book-library
+      run: helm dependency build
     - name: Deploy with Helm
       shell: bash
       working-directory: ./helm/book-library
