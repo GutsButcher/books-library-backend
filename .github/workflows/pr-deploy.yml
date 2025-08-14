@@ -55,7 +55,7 @@ jobs:
         extra-tags: pr-${{ github.event.pull_request.number }}-${{ steps.short-sha.outputs.sha }}
   deploy-preview:
     name: deploy PR Preview
-    runs-on: wsl
+    runs-on: self-hosted
     needs: setup-preview
     if: github.event.pull_request.draft == false
     
@@ -111,7 +111,7 @@ jobs:
 
   cleanup-preview:
     name: Cleanup PR Preview
-    runs-on: wsl
+    runs-on: self-hosted
     needs: setup-preview
     if: github.event.action == 'closed'
     steps:
