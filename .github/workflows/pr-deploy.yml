@@ -48,7 +48,7 @@ jobs:
         password: ${{ secrets.DOCKER_PASSWORD }}
         image-name: ${{ env.IMAGE_NAME }}
         push: true
-        extra-tags: pr-${{ github.event.pull_request.number }}-${{ github.sha }}
+        extra-tags: pr-${{ github.event.pull_request.number }}
   deploy-preview:
     name: deploy PR Preview
     runs-on: wsl
