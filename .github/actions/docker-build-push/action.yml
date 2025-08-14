@@ -71,6 +71,7 @@ runs:
           type=semver,pattern={{version}}
           type=semver,pattern={{major}}.{{minor}}
           type=raw,value=latest,enable={{is_default_branch}}
+          type=raw,value=${{ inputs.extra-tags }},enable=${{ inputs.extra-tags != '' }}
 
     - name: Build and push Docker image
       id: build
@@ -79,9 +80,7 @@ runs:
         context: ${{ inputs.context }}
         file: ${{ inputs.dockerfile }}
         push: ${{ inputs.push }}
-        tags: |
-          ${{ steps.meta.outputs.tags }}
-          ${{ inputs.extra-tags }}
+        tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
         build-args: ${{ inputs.build-args }}
         cache-from: type=gha
