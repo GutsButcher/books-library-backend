@@ -64,7 +64,7 @@ jobs:
         release-name: ${{ needs.setup-preview.outputs.release-name }}
         namespace: ${{ needs.setup-preview.outputs.namespace }}
         environment: dev
-        image-tag: pr-${{ github.event.pull_request.number }}-${GITHUB_SHA::8}
+        image-tag: pr-${{ github.event.pull_request.number }}-${{ github.sha }}
         timeout: 5m
   
   comment-pr:
