@@ -10,15 +10,18 @@ env:
   IMAGE_NAME: gwynbliedd/book-library
 
 jobs:
-  deploy-preview:
+  setup-preview:
     name: Deploy PR Preview
     runs-on: ubuntu-latest
     if: github.event.pull_request.draft == false
+    outputs:
+      release-name: ${{ steps.preview.outputs.release-name }}
+      namespace: ${{ steps.preview.outputs.namespace }}
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-
+      #generate steps are meant to just provide something to >> $GITHUB_OUTPUT in format key=value
     - name: Generate preview namespace
       id: preview
       run: |
@@ -45,23 +48,36 @@ jobs:
         password: ${{ secrets.DOCKER_PASSWORD }}
         image-name: ${{ env.IMAGE_NAME }}
         push: true
-
+        extra-tags: pr-${{ github.event.pull_request.number }}-${GITHUB_SHA::8}
+  deploy-preview:
+    name: deploy PR Preview
+    runs-on: wsl
+    needs: setup-preview
+    if: github.event.pull_request.draft == false
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
     - name: Deploy PR Preview
       uses: ./.github/actions/helm-deploy
       with:
-        release-name: ${{ steps.preview.outputs.release-name }}
-        namespace: ${{ steps.preview.outputs.namespace }}
+        release-name: ${{ needs.setup-preview.outputs.release-name }}
+        namespace: ${{ needs.setup-preview.outputs.namespace }}
         environment: dev
         image-tag: pr-${{ github.event.pull_request.number }}-${GITHUB_SHA::8}
-        kubeconfig: ${{ secrets.KUBECONFIG_DEV }}
         timeout: 5m
-
+  
+  comment-pr:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    needs: setup-preview
+    steps:
     - name: Comment PR
       uses: actions/github-script@v7
       with:
         script: |
           const prNumber = context.payload.pull_request.number;
-          const namespace = '${{ steps.preview.outputs.namespace }}';
+          const namespace = '${{ needs.setup-preview.outputs.namespace }}';
           const url = `https://pr-${prNumber}.dev-book-library.example.com`;
           
           const comment = `## 🚀 Preview Deployment Ready!
@@ -83,33 +99,18 @@ jobs:
 
   cleanup-preview:
     name: Cleanup PR Preview
-    runs-on: ubuntu-latest
+    runs-on: wsl
+    needs: setup-preview
     if: github.event.action == 'closed'
-    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Generate preview namespace
-      id: preview
-      run: |
-        PR_NUMBER=${{ github.event.pull_request.number }}
-        NAMESPACE="book-library-pr-${PR_NUMBER}"
-        RELEASE_NAME="book-library-pr-${PR_NUMBER}"
-        echo "namespace=${NAMESPACE}" >> $GITHUB_OUTPUT
-        echo "release-name=${RELEASE_NAME}" >> $GITHUB_OUTPUT
-
-    - name: Setup kubectl
-      run: |
-        mkdir -p $HOME/.kube
-        echo "${{ secrets.KUBECONFIG_DEV }}" | base64 -d > $HOME/.kube/config
-        chmod 600 $HOME/.kube/config
-
     - name: Delete preview deployment
       run: |
-        helm uninstall ${{ steps.preview.outputs.release-name }} -n ${{ steps.preview.outputs.namespace }} || true
-        kubectl delete namespace ${{ steps.preview.outputs.namespace }} --wait=false || true
-
+        helm uninstall ${{ needs.setup-preview.outputs.release-name }} -n ${{ needs.setup-preview.outputs.namespace }} || true
+        kubectl delete namespace ${{ needs.setup-preview.outputs.namespace }} --wait=false || true
+  
+  post-cleanup-pr-comment:
+    runs-on: ubuntu-latest
+    steps:
     - name: Comment PR
       uses: actions/github-script@v7
       with:
