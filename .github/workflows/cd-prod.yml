@@ -1,0 +1,185 @@
+name: CD - Deploy to Production
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      image-tag:
+        description: 'Docker image tag to deploy (must be from staging)'
+        required: true
+        type: string
+
+env:
+  ENVIRONMENT: prod
+  NAMESPACE: book-library-prod
+  RELEASE_NAME: book-library
+
+jobs:
+  validate:
+    name: Validate Deployment
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Validate image tag
+      run: |
+        # Ensure image tag contains 'staging' prefix for production deployments
+        if [[ ! "${{ github.event.inputs.image-tag }}" =~ staging- ]] && [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          echo "Error: Production deployments must use staging-tested images"
+          exit 1
+        fi
+
+  deploy:
+    name: Deploy to Production
+    runs-on: wsl  # Self-hosted runner
+    needs: validate
+    environment: 
+      name: production
+      url: https://book-library.example.com
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Get image tag
+      id: image-tag
+      run: |
+        if [ -n "${{ github.event.inputs.image-tag }}" ]; then
+          echo "tag=${{ github.event.inputs.image-tag }}" >> $GITHUB_OUTPUT
+        else
+          # For automatic deployments from main, use the latest staging image
+          echo "tag=staging-$(date +'%Y%m%d')-${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Setup kubectl
+      run: |
+        # kubectl should already be available on self-hosted runner
+        kubectl version --client
+
+    - name: Deploy with Helm (Dry Run)
+      shell: bash
+      run: |
+        cd helm/book-library
+        
+        # Update dependencies
+        helm dependency update
+        
+        # Dry run first
+        helm upgrade --install ${{ env.RELEASE_NAME }} . \
+          --namespace=${{ env.NAMESPACE }} \
+          --create-namespace \
+          --values=values.yaml \
+          --values=values-${{ env.ENVIRONMENT }}.yaml \
+          --set=image.tag=${{ steps.image-tag.outputs.tag }} \
+          --timeout=10m \
+          --dry-run \
+          --debug
+
+    - name: Create backup
+      run: |
+        # Backup current deployment
+        kubectl get all -n ${{ env.NAMESPACE }} -o yaml > backup-$(date +%Y%m%d-%H%M%S).yaml
+        
+        # Backup database
+        kubectl exec -n ${{ env.NAMESPACE }} deployment/${{ env.RELEASE_NAME }}-postgresql -- \
+          pg_dump -U produser prodbookdb > db-backup-$(date +%Y%m%d-%H%M%S).sql || true
+
+    - name: Deploy with Helm
+      shell: bash
+      run: |
+        cd helm/book-library
+        
+        helm upgrade --install ${{ env.RELEASE_NAME }} . \
+          --namespace=${{ env.NAMESPACE }} \
+          --create-namespace \
+          --values=values.yaml \
+          --values=values-${{ env.ENVIRONMENT }}.yaml \
+          --set=image.tag=${{ steps.image-tag.outputs.tag }} \
+          --timeout=10m \
+          --wait \
+          --atomic
+
+    - name: Verify deployment
+      run: |
+        # Wait for rollout to complete
+        kubectl rollout status deployment/${{ env.RELEASE_NAME }} -n ${{ env.NAMESPACE }} --timeout=5m
+        
+        # Check pod status
+        kubectl get pods -n ${{ env.NAMESPACE }} -l app.kubernetes.io/instance=${{ env.RELEASE_NAME }}
+        
+        # Run health checks
+        PROD_URL="https://book-library.example.com"
+        
+        echo "Running production health checks..."
+        curl -f "$PROD_URL/actuator/health" || exit 1
+        curl -f "$PROD_URL/api/books" || exit 1
+        
+        echo "Production deployment verified!"
+
+    - name: Create deployment record
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const deployment = await github.rest.repos.createDeployment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            ref: context.sha,
+            environment: 'production',
+            description: 'Deployed to production environment',
+            auto_merge: false,
+            required_contexts: [],
+            production_environment: true,
+            payload: {
+              image_tag: '${{ steps.image-tag.outputs.tag }}',
+              namespace: '${{ env.NAMESPACE }}'
+            }
+          });
+          
+          await github.rest.repos.createDeploymentStatus({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            deployment_id: deployment.data.id,
+            state: 'success',
+            environment_url: 'https://book-library.example.com',
+            description: 'Production deployment successful'
+          });
+
+    - name: Notify Slack
+      if: always()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: |
+          🚀 Production Deployment ${{ job.status }}
+          Image: ${{ steps.image-tag.outputs.tag }}
+          Environment: ${{ env.ENVIRONMENT }}
+          URL: https://book-library.example.com
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  rollback:
+    name: Rollback Production
+    runs-on: wsl  # Self-hosted runner
+    needs: deploy
+    if: failure()
+    
+    steps:
+    - name: Rollback deployment
+      run: |
+        echo "Rolling back production deployment..."
+        helm rollback ${{ env.RELEASE_NAME }} -n ${{ env.NAMESPACE }}
+        
+        # Wait for rollback
+        kubectl rollout status deployment/${{ env.RELEASE_NAME }} -n ${{ env.NAMESPACE }} --timeout=5m
+        
+    - name: Notify rollback
+      uses: 8398a7/action-slack@v3
+      with:
+        status: 'warning'
+        text: |
+          ⚠️ Production deployment rolled back
+          Environment: ${{ env.ENVIRONMENT }}
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}

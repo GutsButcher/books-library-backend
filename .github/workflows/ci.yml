@@ -1,0 +1,132 @@
+name: CI Pipeline
+
+#this workflow triggers on
+on:
+  push:
+    branches: [ dev, staging, main ]
+  pull_request:
+    branches: [ dev, staging, main ]
+  workflow_dispatch:
+
+#configurations
+env:
+  JAVA_VERSION: '17'
+  DOCKER_REGISTRY: docker.io
+  IMAGE_NAME: gwynbliedd/book-library
+
+
+jobs:
+# always start with test job
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      #checkout your repo
+    - name: Checkout code
+      uses: actions/checkout@v4
+      #setup maven and java through an action that setup maven and setup cache action
+    - name: Setup Java and Maven
+      uses: ./.github/actions/setup-java-maven
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+
+    - name: Run tests
+      run: mvn clean test
+
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: test
+    
+    outputs:
+      artifact-version: ${{ steps.version.outputs.version }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Java and Maven
+      uses: ./.github/actions/setup-java-maven
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+
+    - name: Extract version
+      id: version
+      run: |
+        VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Application version: $VERSION"
+
+    - name: Build application
+      run: mvn clean package -DskipTests
+
+    - name: Upload JAR artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: app-jar
+        path: target/*.jar
+
+  docker:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: build
+    # this will not run on PR
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    outputs:
+      image-tag: ${{ steps.docker-build.outputs.image-tag }}
+      image-digest: ${{ steps.docker-build.outputs.image-digest }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download JAR artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: app-jar
+        path: target/
+
+    - name: Build and Push Docker Image
+      id: docker-build
+      uses: ./.github/actions/docker-build-push
+      with:
+        registry: ${{ env.DOCKER_REGISTRY }}
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+        image-name: ${{ env.IMAGE_NAME }}
+        push: ${{ github.event_name == 'push' }}
+
+    - name: Generate SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ steps.docker-build.outputs.image-tag }}
+        format: spdx-json
+        output-file: sbom.spdx.json
+
+    - name: Upload SBOM
+      uses: actions/upload-artifact@v4
+      with:
+        name: sbom
+        path: sbom.spdx.json
+
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.event_name == 'push'
+    
+    steps:
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ needs.docker.outputs.image-tag }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
