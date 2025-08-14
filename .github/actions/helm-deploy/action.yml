@@ -26,8 +26,10 @@ runs:
   using: 'composite'
   steps:
     - name: add bitnami helm repo
+      shell: bash
       run: helm repo add bitnami https://charts.bitnami.com/bitnami
     - name: update helm repos
+      shell: bash
       run: helm repo update
     - name: Deploy with Helm
       shell: bash
