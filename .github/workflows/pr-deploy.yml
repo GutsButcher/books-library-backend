@@ -48,7 +48,7 @@ jobs:
         password: ${{ secrets.DOCKER_PASSWORD }}
         image-name: ${{ env.IMAGE_NAME }}
         push: true
-        extra-tags: pr-${{ github.event.pull_request.number }}-${GITHUB_SHA::8}
+        extra-tags: pr-${{ github.event.pull_request.number }}-${{ github.sha }}
   deploy-preview:
     name: deploy PR Preview
     runs-on: wsl
@@ -110,6 +110,7 @@ jobs:
   
   post-cleanup-pr-comment:
     runs-on: ubuntu-latest
+    needs: cleanup-preview
     steps:
     - name: Comment PR
       uses: actions/github-script@v7
