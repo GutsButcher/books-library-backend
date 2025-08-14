@@ -17,6 +17,7 @@ jobs:
     outputs:
       release-name: ${{ steps.preview.outputs.release-name }}
       namespace: ${{ steps.preview.outputs.namespace }}
+      short-sha: ${{ steps.short-sha.outputs.sha }}
     
     steps:
     - name: Checkout code
@@ -48,7 +49,7 @@ jobs:
       with:
         registry: ${{ env.DOCKER_REGISTRY }}
         username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
+        password: ${{ secrets.DOCKER_TOKEN }}
         image-name: ${{ env.IMAGE_NAME }}
         push: true
         extra-tags: pr-${{ github.event.pull_request.number }}-${{ steps.short-sha.outputs.sha }}
@@ -67,7 +68,7 @@ jobs:
         release-name: ${{ needs.setup-preview.outputs.release-name }}
         namespace: ${{ needs.setup-preview.outputs.namespace }}
         environment: dev
-        image-tag: pr-${{ github.event.pull_request.number }}-${{ github.sha }}
+        image-tag: pr-${{ github.event.pull_request.number }}-${{ needs.setup-preview.outputs.short-sha }}
         timeout: 5m
   
   comment-pr:
