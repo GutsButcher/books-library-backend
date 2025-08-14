@@ -60,6 +60,14 @@ jobs:
     if: github.event.pull_request.draft == false
     
     steps:
+    - name: debug message
+      run: |
+              echo "Runner OS: $RUNNER_OS"
+              echo "Runner arch: $RUNNER_ARCH"
+              which helm
+              which kubectl
+              kubectl version --client
+
     - name: Checkout code
       uses: actions/checkout@v4
     - name: Deploy PR Preview
@@ -74,7 +82,7 @@ jobs:
   comment-pr:
     runs-on: ubuntu-latest
     if: github.event.pull_request.draft == false
-    needs: setup-preview
+    needs: [setup-preview, deploy-preview]
     steps:
     - name: Comment PR
       uses: actions/github-script@v7
