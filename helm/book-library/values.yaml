@@ -119,7 +119,7 @@ postgresql:
 # Probes configuration
 probes:
   liveness:
-    enabled: true
+    enabled: false
     httpGet:
       path: /actuator/health
       port: http
@@ -129,7 +129,7 @@ probes:
     failureThreshold: 3
     successThreshold: 1
   readiness:
-    enabled: true
+    enabled: false
     httpGet:
       path: /actuator/health/readiness
       port: http
