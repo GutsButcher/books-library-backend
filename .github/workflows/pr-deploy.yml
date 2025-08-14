@@ -2,8 +2,14 @@ name: PR Preview Deployment
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, closed]
     branches: [dev, staging]
+
+# Add permissions for the workflow
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
 
 env:
   DOCKER_REGISTRY: docker.io
@@ -13,7 +19,7 @@ jobs:
   setup-preview:
     name: Deploy PR Preview
     runs-on: ubuntu-latest
-    if: github.event.pull_request.draft == false
+    if: github.event.pull_request.draft == false && github.event.action != 'closed'
     outputs:
       release-name: ${{ steps.preview.outputs.release-name }}
       namespace: ${{ steps.preview.outputs.namespace }}
@@ -22,7 +28,7 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      #generate steps are meant to just provide something to >> $GITHUB_OUTPUT in format key=value
+      
     - name: Generate preview namespace
       id: preview
       run: |
@@ -43,6 +49,7 @@ jobs:
     - name: Set short SHA
       id: short-sha
       run: echo "sha=$(echo ${{ github.sha }} | cut -c1-8 )" >> $GITHUB_OUTPUT
+      
     - name: Build and Push Docker Image
       id: docker-build
       uses: ./.github/actions/docker-build-push
@@ -53,23 +60,25 @@ jobs:
         image-name: ${{ env.IMAGE_NAME }}
         push: true
         extra-tags: pr-${{ github.event.pull_request.number }}-${{ steps.short-sha.outputs.sha }}
+
   deploy-preview:
-    name: deploy PR Preview
+    name: Deploy PR Preview
     runs-on: self-hosted
     needs: setup-preview
-    if: github.event.pull_request.draft == false
+    if: github.event.pull_request.draft == false && github.event.action != 'closed'
     
     steps:
-    - name: debug message
+    - name: Debug message
       run: |
-              echo "Runner OS: $RUNNER_OS"
-              echo "Runner arch: $RUNNER_ARCH"
-              which helm
-              which kubectl
-              kubectl version --client
+        echo "Runner OS: $RUNNER_OS"
+        echo "Runner arch: $RUNNER_ARCH"
+        which helm
+        which kubectl
+        kubectl version --client
 
     - name: Checkout code
       uses: actions/checkout@v4
+      
     - name: Deploy PR Preview
       uses: ./.github/actions/helm-deploy
       with:
@@ -81,12 +90,13 @@ jobs:
   
   comment-pr:
     runs-on: ubuntu-latest
-    if: github.event.pull_request.draft == false
     needs: [setup-preview, deploy-preview]
+    if: github.event.pull_request.draft == false && github.event.action != 'closed'
     steps:
     - name: Comment PR
       uses: actions/github-script@v7
       with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
         script: |
           const prNumber = context.payload.pull_request.number;
           const namespace = '${{ needs.setup-preview.outputs.namespace }}';
@@ -98,7 +108,7 @@ jobs:
           
           - **URL**: ${url}
           - **Namespace**: ${namespace}
-          - **Image**: pr-${prNumber}-${context.sha.substring(0, 8)}
+          - **Image**: pr-${prNumber}-${{ needs.setup-preview.outputs.short-sha }}
           
           The preview will be automatically cleaned up when the PR is closed.`;
           
@@ -109,24 +119,35 @@ jobs:
             body: comment
           });
 
+  # Separate job that only runs on PR close
   cleanup-preview:
     name: Cleanup PR Preview
     runs-on: self-hosted
-    needs: setup-preview
     if: github.event.action == 'closed'
     steps:
+    - name: Generate preview info
+      id: preview-info
+      run: |
+        PR_NUMBER=${{ github.event.pull_request.number }}
+        NAMESPACE="book-library-pr-${PR_NUMBER}"
+        RELEASE_NAME="book-library-pr-${PR_NUMBER}"
+        echo "namespace=${NAMESPACE}" >> $GITHUB_OUTPUT
+        echo "release-name=${RELEASE_NAME}" >> $GITHUB_OUTPUT
+        
     - name: Delete preview deployment
       run: |
-        helm uninstall ${{ needs.setup-preview.outputs.release-name }} -n ${{ needs.setup-preview.outputs.namespace }} || true
-        kubectl delete namespace ${{ needs.setup-preview.outputs.namespace }} --wait=false || true
+        helm uninstall ${{ steps.preview-info.outputs.release-name }} -n ${{ steps.preview-info.outputs.namespace }} || true
+        kubectl delete namespace ${{ steps.preview-info.outputs.namespace }} --wait=false || true
   
   post-cleanup-pr-comment:
     runs-on: ubuntu-latest
     needs: cleanup-preview
+    if: github.event.action == 'closed'
     steps:
     - name: Comment PR
       uses: actions/github-script@v7
       with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
         script: |
           const prNumber = context.payload.pull_request.number;
           
