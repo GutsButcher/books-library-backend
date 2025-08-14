@@ -25,6 +25,10 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    - name: add bitnami helm repo
+      run: helm repo add bitnami https://charts.bitnami.com/bitnami
+    - name: update helm repos
+      run: helm repo update
     - name: Deploy with Helm
       shell: bash
       working-directory: ./helm/book-library
