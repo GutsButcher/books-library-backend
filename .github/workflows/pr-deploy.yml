@@ -2,7 +2,7 @@ name: PR Preview Deployment
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, closed]
+    types: [opened, synchronize, reopened, closed, labeled]
     branches: [dev, staging]
   issue_comment:
     types: [created]
@@ -174,6 +174,14 @@ jobs:
        github.event.comment.author_association == 'MEMBER' ||
        github.event.comment.author_association == 'COLLABORATOR')
     steps:
+    - name: Debug info
+      run: |
+        echo "Event: ${{ github.event_name }}"
+        echo "Action: ${{ github.event.action }}"
+        echo "Comment body: ${{ github.event.comment.body }}"
+        echo "Author association: ${{ github.event.comment.author_association }}"
+        echo "Is PR: ${{ !!github.event.issue.pull_request }}"
+        
     - name: Trigger deployment
       uses: actions/github-script@v7
       with:
@@ -197,11 +205,14 @@ jobs:
             body: '🚀 Deployment triggered! Please wait while the preview environment is being set up...'
           });
 
-  # Separate job that only runs on PR close
+  # Separate job that only runs on PR close AND has the pr-deploy label
   cleanup-preview:
     name: Cleanup PR Preview
     runs-on: self-hosted
-    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    if: |
+      github.event_name == 'pull_request' && 
+      github.event.action == 'closed' &&
+      contains(github.event.pull_request.labels.*.name, 'pr-deploy')
     steps:
     - name: Generate preview info
       id: preview-info
@@ -220,7 +231,10 @@ jobs:
   post-cleanup-pr-comment:
     runs-on: ubuntu-latest
     needs: cleanup-preview
-    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    if: |
+      github.event_name == 'pull_request' && 
+      github.event.action == 'closed' &&
+      contains(github.event.pull_request.labels.*.name, 'pr-deploy')
     steps:
     - name: Comment PR
       uses: actions/github-script@v7
