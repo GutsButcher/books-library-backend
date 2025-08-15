@@ -2,7 +2,7 @@ name: PR Preview Deployment
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, closed, labeled]
+    types: [opened, synchronize, reopened, closed, labeled,unlabeled]
     branches: [dev, staging]
   issue_comment:
     types: [created]
@@ -211,8 +211,10 @@ jobs:
     runs-on: self-hosted
     if: |
       github.event_name == 'pull_request' && 
-      github.event.action == 'closed' &&
-      contains(github.event.pull_request.labels.*.name, 'pr-deploy')
+      (
+      (github.event.action == 'closed' && contains(github.event.pull_request.labels.*.name, 'pr-deploy')) ||
+      (github.event.action == 'unlabeled' && github.event.label.name == 'pr-deploy')
+      ) 
     steps:
     - name: Generate preview info
       id: preview-info
@@ -233,8 +235,10 @@ jobs:
     needs: cleanup-preview
     if: |
       github.event_name == 'pull_request' && 
-      github.event.action == 'closed' &&
-      contains(github.event.pull_request.labels.*.name, 'pr-deploy')
+      (
+      (github.event.action == 'closed' && contains(github.event.pull_request.labels.*.name, 'pr-deploy')) ||
+      (github.event.action == 'unlabeled' && github.event.label.name == 'pr-deploy')
+      ) 
     steps:
     - name: Comment PR
       uses: actions/github-script@v7
