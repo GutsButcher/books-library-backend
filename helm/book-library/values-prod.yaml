@@ -1,0 +1,73 @@
+# Production environment values
+replicaCount: 3
+
+image:
+  pullPolicy: IfNotPresent
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+  hosts:
+    - host: book-library.example.com
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls:
+    - secretName: book-library-tls
+      hosts:
+        - book-library.example.com
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+  requests:
+    cpu: 500m
+    memory: 512Mi
+
+app:
+  env:
+    - name: SPRING_PROFILES_ACTIVE
+      value: "prod,kubernetes"
+    - name: SERVER_PORT
+      value: "8080"
+    - name: SPRING_JPA_SHOW_SQL
+      value: "false"
+    - name: LOG_LEVEL
+      value: "WARN"
+
+postgresql:
+  enabled: true
+  auth:
+    postgresPassword: "prodpostgres"
+    username: "produser"
+    password: "prodpass"
+    database: "prodbookdb"
+  persistence:
+    size: 20Gi
+    storageClass: "fast-ssd"
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 60
+  targetMemoryUtilizationPercentage: 70
+
+# Production-specific security settings
+podSecurityContext:
+  fsGroup: 2000
+  runAsNonRoot: true
+  runAsUser: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  capabilities:
+    drop:
+    - ALL
