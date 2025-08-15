@@ -4,6 +4,8 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, closed]
     branches: [dev, staging]
+  issue_comment:
+    types: [created]
 
 # Add permissions for the workflow
 permissions:
@@ -16,19 +18,24 @@ env:
   IMAGE_NAME: gwynbliedd/book-library
 
 jobs:
+  # Job that only runs on workflow_dispatch or when PR has deploy label
   setup-preview:
-    name: Deploy PR Preview
+    name: Setup PR Preview
     runs-on: ubuntu-latest
-    if: github.event.pull_request.draft == false && github.event.action != 'closed'
+    if: |
+      github.event.pull_request.draft == false && 
+      github.event.action != 'closed' && 
+      contains(github.event.pull_request.labels.*.name, 'pr-deploy')
     outputs:
       release-name: ${{ steps.preview.outputs.release-name }}
       namespace: ${{ steps.preview.outputs.namespace }}
       short-sha: ${{ steps.short-sha.outputs.sha }}
+      pr-number: ${{ github.event.pull_request.number }}
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      
+        
     - name: Generate preview namespace
       id: preview
       run: |
@@ -65,7 +72,10 @@ jobs:
     name: Deploy PR Preview
     runs-on: self-hosted
     needs: setup-preview
-    if: github.event.pull_request.draft == false && github.event.action != 'closed'
+    if: |
+      github.event.pull_request.draft == false && 
+      github.event.action != 'closed' && 
+      contains(github.event.pull_request.labels.*.name, 'pr-deploy')
     
     steps:
     - name: Debug message
@@ -91,7 +101,10 @@ jobs:
   comment-pr:
     runs-on: ubuntu-latest
     needs: [setup-preview, deploy-preview]
-    if: github.event.pull_request.draft == false && github.event.action != 'closed'
+    if: |
+      github.event.pull_request.draft == false && 
+      github.event.action != 'closed' && 
+      contains(github.event.pull_request.labels.*.name, 'pr-deploy')
     steps:
     - name: Comment PR
       uses: actions/github-script@v7
@@ -100,13 +113,11 @@ jobs:
         script: |
           const prNumber = context.payload.pull_request.number;
           const namespace = '${{ needs.setup-preview.outputs.namespace }}';
-          const url = `https://pr-${prNumber}.dev-book-library.example.com`;
           
           const comment = `## 🚀 Preview Deployment Ready!
           
           Your PR has been deployed to a preview environment:
           
-          - **URL**: ${url}
           - **Namespace**: ${namespace}
           - **Image**: pr-${prNumber}-${{ needs.setup-preview.outputs.short-sha }}
           
@@ -119,11 +130,78 @@ jobs:
             body: comment
           });
 
+  # Job to add helpful comment when PR is opened without deploy label
+  pr-opened-info:
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'pull_request' && 
+      github.event.action == 'opened' && 
+      github.event.pull_request.draft == false && 
+      !contains(github.event.pull_request.labels.*.name, 'pr-deploy')
+    steps:
+    - name: Comment PR with deploy instructions
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const prNumber = context.payload.pull_request.number;
+          
+          const comment = `## 🚀 Preview Deployment Available
+          
+          To deploy a preview environment for this PR, you can:
+          
+          1. **Add the \`pr-deploy\` label** to this PR, or
+          2. **Comment with \`/deploy\`** (if you implement the comment trigger)
+          
+          The preview will be automatically cleaned up when the PR is closed.`;
+          
+          github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber,
+            body: comment
+          });
+
+  # Optional: Deploy on comment trigger
+  deploy-on-comment:
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/deploy') &&
+      (github.event.comment.author_association == 'OWNER' || 
+       github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR')
+    steps:
+    - name: Trigger deployment
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const prNumber = context.issue.number;
+          
+          // Add pr-deploy label
+          await github.rest.issues.addLabels({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber,
+            labels: ['pr-deploy']
+          });
+          
+          // Comment that deployment is starting
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber,
+            body: '🚀 Deployment triggered! Please wait while the preview environment is being set up...'
+          });
+
   # Separate job that only runs on PR close
   cleanup-preview:
     name: Cleanup PR Preview
     runs-on: self-hosted
-    if: github.event.action == 'closed'
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
     steps:
     - name: Generate preview info
       id: preview-info
@@ -142,7 +220,7 @@ jobs:
   post-cleanup-pr-comment:
     runs-on: ubuntu-latest
     needs: cleanup-preview
-    if: github.event.action == 'closed'
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
     steps:
     - name: Comment PR
       uses: actions/github-script@v7
