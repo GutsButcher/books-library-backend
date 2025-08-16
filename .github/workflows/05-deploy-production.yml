@@ -1,0 +1,393 @@
+# ===============================================
+# PRODUCTION ENVIRONMENT DEPLOYMENT PIPELINE
+# ===============================================
+# This workflow handles deployments to the production environment.
+# Production deployments are critical and include additional safeguards.
+#
+# Triggers:
+# - Automatic: Push to main branch (after CI builds image)
+# - Manual: workflow_dispatch with optional image tag
+#
+# Safety Features:
+# - Environment protection rules (requires approval)
+# - Database backup before deployment
+# - Dry-run validation
+# - Comprehensive health checks
+# - Automatic rollback on failure
+#
+# Prerequisites:
+# - Self-hosted runner with kubectl and helm
+# - Production environment configured with protection rules
+# - KUBECONFIG available on runner
+# ===============================================
+
+name: 05 - Deploy to Production
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      image-tag:
+        description: 'Docker image tag to deploy (defaults to latest main tag)'
+        required: false
+        type: string
+
+# Production environment configuration
+env:
+  ENVIRONMENT: prod
+  NAMESPACE: book-library-prod
+  RELEASE_NAME: book-library
+  PROD_URL: https://book-library.example.com
+  BACKUP_RETENTION_DAYS: 30
+  DOCKER_REGISTRY: docker.io
+  IMAGE_NAME: gwynbliedd/book-library
+  ENABLE_SMOKE_TESTS: ""  # Set to "true" to enable smoke tests
+
+jobs:
+  # ===============================================
+  # PRIMARY JOB: Production Deployment
+  # ===============================================
+  production-deployment:
+    name: Deploy to Production
+    runs-on: self-hosted  # Must have kubectl, helm, and proper kubeconfig
+    environment: 
+      name: production
+      url: ${{ env.PROD_URL }}
+    
+    steps:
+    # ===============================================
+    # STEP 1: Setup and Preparation
+    # ===============================================
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # Determine deployment image
+    - name: Select deployment image
+      id: image-tag
+      run: |
+        if [ -n "${{ github.event.inputs.image-tag }}" ]; then
+          # Manual deployment with specific tag
+          IMAGE_TAG="${{ github.event.inputs.image-tag }}"
+          echo "📌 Manual deployment with image tag: $IMAGE_TAG"
+        else
+          # For automatic deployment on push, use a unique tag with commit SHA
+          # This ensures we wait for the exact image from this push, not an old one
+          IMAGE_TAG="main-${{ github.sha }}"
+          echo "🔄 Using commit-specific image tag from CI pipeline: $IMAGE_TAG"
+        fi
+        
+        echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+        echo "🐳 Production image: gwynbliedd/book-library:$IMAGE_TAG"
+
+    # Verify runner environment
+    - name: Validate runner tools
+      run: |
+        echo "🔍 Validating production runner environment..."
+        
+        # Check required tools
+        command -v kubectl >/dev/null 2>&1 || { echo "❌ kubectl is required"; exit 1; }
+        command -v helm >/dev/null 2>&1 || { echo "❌ helm is required"; exit 1; }
+        command -v jq >/dev/null 2>&1 || { echo "❌ jq is required"; exit 1; }
+        
+        # Display versions
+        echo "📦 Tool versions:"
+        kubectl version --client --short
+        helm version --short
+        
+        # Verify cluster connectivity
+        echo "🔗 Verifying cluster access..."
+        kubectl cluster-info
+        
+        echo "✅ Runner environment validated"
+
+    # ===============================================
+    # STEP 2: Wait for Docker Image Availability
+    # ===============================================
+    # When triggered by push, CI and deployment run in parallel
+    # We need to wait for the CI to build and push the image
+    - name: Wait for production image
+      if: github.event_name == 'push'
+      run: |
+        echo "⏳ Waiting for CI pipeline to build and push production image..."
+        echo "🔍 Checking for image: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }}"
+        
+        # Maximum wait time: 25 minutes (100 attempts with 15 second intervals)
+        # Production CI may take longer due to additional checks
+        MAX_ATTEMPTS=100
+        ATTEMPT=0
+        
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          ATTEMPT=$((ATTEMPT + 1))
+          echo "Attempt $ATTEMPT of $MAX_ATTEMPTS..."
+          
+          # Check if image exists in registry
+          if docker manifest inspect "${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }}" >/dev/null 2>&1; then
+            echo "✅ Production image found! Proceeding with deployment."
+            break
+          fi
+          
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "❌ Timeout waiting for production image. CI pipeline may have failed."
+            echo "Please check the CI pipeline status."
+            exit 1
+          fi
+          
+          # Wait 15 seconds before next attempt
+          echo "Image not found yet. Waiting 15 seconds..."
+          sleep 15
+        done
+        
+        # Extra wait to ensure image is fully propagated
+        echo "⏳ Waiting additional 20 seconds for registry propagation..."
+        sleep 20
+
+    # ===============================================
+    # STEP 3: Pre-Deployment Backup
+    # ===============================================
+    - name: Create production backup
+      id: backup
+      run: |
+        echo "💾 Creating pre-deployment backup..."
+        
+        TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+        BACKUP_DIR="backups/prod-$TIMESTAMP"
+        mkdir -p $BACKUP_DIR
+        
+        # Backup current deployment state
+        echo "📋 Backing up Kubernetes resources..."
+        kubectl get all,cm,secret,pvc -n ${{ env.NAMESPACE }} -o yaml > $BACKUP_DIR/k8s-resources.yaml || true
+        
+        # Get current deployment image for rollback reference
+        CURRENT_IMAGE=$(kubectl get deployment ${{ env.RELEASE_NAME }} -n ${{ env.NAMESPACE }} -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "none")
+        echo "current-image=$CURRENT_IMAGE" >> $GITHUB_OUTPUT
+        echo "📸 Current production image: $CURRENT_IMAGE"
+        
+        # Backup database (if PostgreSQL pod exists)
+        echo "🗄️ Attempting database backup..."
+        if kubectl get pod -n ${{ env.NAMESPACE }} -l app.kubernetes.io/name=postgresql -o name | grep -q pod; then
+          POD=$(kubectl get pod -n ${{ env.NAMESPACE }} -l app.kubernetes.io/name=postgresql -o name | head -1 | cut -d/ -f2)
+          kubectl exec -n ${{ env.NAMESPACE }} $POD -- pg_dump -U produser prodbookdb | gzip > $BACKUP_DIR/database.sql.gz
+          echo "✅ Database backup completed"
+        else
+          echo "⚠️  No PostgreSQL pod found, skipping database backup"
+        fi
+        
+        # Store backup info
+        echo "backup-dir=$BACKUP_DIR" >> $GITHUB_OUTPUT
+        echo "✅ Backup completed: $BACKUP_DIR"
+
+    # ===============================================
+    # STEP 4: Deployment Validation (Dry Run)
+    # ===============================================
+    - name: Validate deployment manifest
+      shell: bash
+      run: |
+        echo "🔍 Validating deployment configuration..."
+        cd helm/book-library
+        
+        # Update Helm dependencies
+        helm dependency update
+        
+        # Perform dry-run to validate
+        helm upgrade --install ${{ env.RELEASE_NAME }} . \
+          --namespace=${{ env.NAMESPACE }} \
+          --create-namespace \
+          --values=values.yaml \
+          --values=values-${{ env.ENVIRONMENT }}.yaml \
+          --set=image.tag=${{ steps.image-tag.outputs.tag }} \
+          --timeout=10m \
+          --dry-run \
+          --debug
+        
+        echo "✅ Deployment validation passed"
+
+    # ===============================================
+    # STEP 5: Execute Production Deployment
+    # ===============================================
+    - name: Deploy to production
+      shell: bash
+      run: |
+        echo "🚀 Starting production deployment..."
+        cd helm/book-library
+        
+        # Execute deployment with atomic flag for automatic rollback
+        helm upgrade --install ${{ env.RELEASE_NAME }} . \
+          --namespace=${{ env.NAMESPACE }} \
+          --create-namespace \
+          --values=values.yaml \
+          --values=values-${{ env.ENVIRONMENT }}.yaml \
+          --set=image.tag=${{ steps.image-tag.outputs.tag }} \
+          --timeout=10m \
+          --wait \
+          --atomic
+        
+        echo "✅ Helm deployment completed"
+
+    # ===============================================
+    # STEP 6: Deployment Verification
+    # ===============================================
+    - name: Verify deployment health
+      run: |
+        echo "🏥 Verifying production deployment health..."
+        
+        # Wait for rollout to complete
+        echo "⏳ Waiting for rollout completion..."
+        kubectl rollout status deployment/${{ env.RELEASE_NAME }} \
+          -n ${{ env.NAMESPACE }} \
+          --timeout=5m
+        
+        # Check pod status
+        echo "🔍 Checking pod status..."
+        kubectl get pods -n ${{ env.NAMESPACE }} \
+          -l app.kubernetes.io/instance=${{ env.RELEASE_NAME }}
+        
+        # Verify all pods are running
+        READY_PODS=$(kubectl get pods -n ${{ env.NAMESPACE }} \
+          -l app.kubernetes.io/instance=${{ env.RELEASE_NAME }} \
+          -o jsonpath='{.items[*].status.containerStatuses[*].ready}' | tr ' ' '\n' | grep -c true || echo 0)
+        
+        TOTAL_PODS=$(kubectl get pods -n ${{ env.NAMESPACE }} \
+          -l app.kubernetes.io/instance=${{ env.RELEASE_NAME }} \
+          -o jsonpath='{.items[*].metadata.name}' | wc -w)
+        
+        echo "📊 Ready pods: $READY_PODS/$TOTAL_PODS"
+        
+        if [ "$READY_PODS" -ne "$TOTAL_PODS" ]; then
+          echo "❌ Not all pods are ready!"
+          exit 1
+        fi
+        
+        echo "✅ All pods are healthy"
+
+    # ===============================================
+    # STEP 7: Production Smoke Tests
+    # ===============================================
+    - name: Execute production tests
+      if: env.ENABLE_SMOKE_TESTS == 'true'
+      run: |
+        echo "🧪 Running production smoke tests..."
+        
+        # Allow time for load balancer updates
+        echo "⏳ Waiting 45 seconds for load balancer propagation..."
+        sleep 45
+        
+        # Test 1: Main health check
+        echo "Test 1: Health check endpoint"
+        curl -f "${{ env.PROD_URL }}/actuator/health" \
+          --max-time 30 \
+          --retry 3 \
+          --retry-delay 5 || exit 1
+        echo "✅ Health check passed"
+        
+        # Test 2: API endpoint
+        echo -e "\nTest 2: API availability"
+        curl -f "${{ env.PROD_URL }}/api/books" \
+          --max-time 30 \
+          --retry 3 \
+          --retry-delay 5 || exit 1
+        echo "✅ API check passed"
+        
+        # Test 3: Database connectivity
+        echo -e "\nTest 3: Database connectivity"
+        HEALTH_RESPONSE=$(curl -sf "${{ env.PROD_URL }}/actuator/health" || echo "{}")
+        if echo "$HEALTH_RESPONSE" | jq -e '.components.db.status == "UP"' >/dev/null 2>&1; then
+          echo "✅ Database connectivity verified"
+        else
+          echo "❌ Database connectivity check failed"
+          echo "Health response: $HEALTH_RESPONSE"
+          exit 1
+        fi
+        
+        # Test 4: Response time check
+        echo -e "\nTest 4: Response time validation"
+        RESPONSE_TIME=$(curl -o /dev/null -s -w '%{time_total}\n' "${{ env.PROD_URL }}/actuator/health")
+        echo "Response time: ${RESPONSE_TIME}s"
+        
+        # Verify response time is under 2 seconds
+        if (( $(echo "$RESPONSE_TIME < 2" | bc -l) )); then
+          echo "✅ Response time acceptable"
+        else
+          echo "⚠️  Response time is slow (${RESPONSE_TIME}s)"
+        fi
+        
+        echo -e "\n🎉 All production tests passed!"
+
+    # ===============================================
+    # STEP 8: Create Deployment Record
+    # ===============================================
+    - name: Record deployment in GitHub
+      uses: actions/github-script@v7
+      with:
+        script: |
+          // Create deployment record
+          const deployment = await github.rest.repos.createDeployment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            ref: context.sha,
+            environment: 'production',
+            description: 'Production deployment',
+            auto_merge: false,
+            required_contexts: [],
+            production_environment: true,
+            payload: {
+              image_tag: '${{ steps.image-tag.outputs.tag }}',
+              previous_image: '${{ steps.backup.outputs.current-image }}',
+              namespace: '${{ env.NAMESPACE }}',
+              backup_location: '${{ steps.backup.outputs.backup-dir }}',
+              triggered_by: '${{ github.event_name }}',
+              actor: '${{ github.actor }}'
+            }
+          });
+          
+          // Mark deployment as successful
+          await github.rest.repos.createDeploymentStatus({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            deployment_id: deployment.data.id,
+            state: 'success',
+            environment_url: '${{ env.PROD_URL }}',
+            description: 'Production deployment successful'
+          });
+          
+          console.log('✅ Deployment record created');
+
+
+  # ===============================================
+  # FALLBACK JOB: Automatic Rollback
+  # ===============================================
+  # This job only runs if the main deployment fails
+  automatic-rollback:
+    name: Emergency Rollback
+    runs-on: self-hosted
+    needs: production-deployment
+    if: failure()  # Only runs if deployment failed
+    
+    steps:
+    - name: Execute rollback
+      run: |
+        echo "🚨 INITIATING EMERGENCY ROLLBACK..."
+        
+        # Rollback using Helm
+        echo "⏮️ Rolling back to previous release..."
+        helm rollback ${{ env.RELEASE_NAME }} -n ${{ env.NAMESPACE }} || {
+          echo "❌ Helm rollback failed!"
+          echo "Manual intervention required!"
+          exit 1
+        }
+        
+        # Wait for rollback to complete
+        echo "⏳ Waiting for rollback to stabilize..."
+        kubectl rollout status deployment/${{ env.RELEASE_NAME }} \
+          -n ${{ env.NAMESPACE }} \
+          --timeout=5m || true
+        
+        # Verify rollback health
+        sleep 30
+        if curl -f "${{ env.PROD_URL }}/actuator/health" --max-time 30; then
+          echo "✅ Rollback successful - Production is healthy"
+        else
+          echo "❌ Rollback completed but health check failed"
+          echo "🚨 MANUAL INTERVENTION REQUIRED!"
+        fi
+        

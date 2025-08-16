@@ -1,0 +1,86 @@
+name: 'Helm Deploy'
+description: 'Deploys application using Helm'
+inputs:
+  release-name:
+    description: 'Helm release name'
+    required: true
+  namespace:
+    description: 'Kubernetes namespace'
+    required: true
+  environment:
+    description: 'Environment (dev, staging, prod)'
+    required: true
+  image-tag:
+    description: 'Docker image tag to deploy'
+    required: true
+  timeout:
+    description: 'Helm timeout'
+    required: false
+    default: '10m'
+  dry-run:
+    description: 'Perform a dry run'
+    required: false
+    default: 'false'
+  extra-values:
+    description: 'Additional helm values to pass'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: add bitnami helm repo
+      shell: bash
+      run: helm repo add bitnami https://charts.bitnami.com/bitnami
+    - name: update helm repos
+      shell: bash
+      run: helm repo update
+    - name: Update helm dependencies
+      shell: bash
+      working-directory: ./helm/book-library
+      run: helm dependency update
+    - name: Deploy with Helm
+      shell: bash
+      working-directory: ./helm/book-library
+      run: |
+        HELM_ARGS=(
+          "upgrade"
+          "--install"
+          "${{ inputs.release-name }}"
+          "."
+          "--namespace=${{ inputs.namespace }}"
+          "--create-namespace"
+          "--values=values.yaml"
+          "--values=values-${{ inputs.environment }}.yaml"
+          "--set=image.tag=${{ inputs.image-tag }}"
+          "--timeout=${{ inputs.timeout }}"
+          "--wait"
+          "--atomic"
+        )
+        
+        if [ "${{ inputs.dry-run }}" == "true" ]; then
+          HELM_ARGS+=("--dry-run")
+          HELM_ARGS+=("--debug")
+        fi
+        
+        # Add extra values if provided
+        if [ -n "${{ inputs.extra-values }}" ]; then
+          # Read extra values line by line and add them to HELM_ARGS
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then
+              HELM_ARGS+=("$line")
+            fi
+          done <<< "${{ inputs.extra-values }}"
+        fi
+        
+        helm "${HELM_ARGS[@]}"
+
+    - name: Get deployment status
+      if: inputs.dry-run == 'false'
+      shell: bash
+      run: |
+        echo "Deployment status:"
+        helm status ${{ inputs.release-name }} -n ${{ inputs.namespace }}
+        echo ""
+        echo "Pods status:"
+        kubectl get pods -n ${{ inputs.namespace }} -l app.kubernetes.io/instance=${{ inputs.release-name }}

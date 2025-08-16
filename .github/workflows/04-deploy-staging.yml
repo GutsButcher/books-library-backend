@@ -1,0 +1,244 @@
+# ===============================================
+# STAGING ENVIRONMENT DEPLOYMENT PIPELINE
+# ===============================================
+# This workflow handles deployments to the staging environment.
+# 
+# Triggers:
+# - Automatic: Push to staging branch (via CI pipeline)
+# - Manual: workflow_dispatch with optional image tag
+#
+# Features:
+# - Dry-run validation before actual deployment
+# - Smoke tests after deployment
+# - GitHub deployment tracking
+# - Slack notifications
+#
+# Prerequisites:
+# - KUBECONFIG_STAGING secret configured
+# - Staging environment in GitHub
+# - Helm chart with staging values file
+# ===============================================
+
+name: 04 - Deploy to Staging
+
+on:
+  push:
+    branches: [ staging ]
+  workflow_dispatch:
+    inputs:
+      image-tag:
+        description: 'Docker image tag to deploy (defaults to latest staging tag)'
+        required: false
+        type: string
+
+# Environment-specific configuration
+env:
+  ENVIRONMENT: staging
+  NAMESPACE: book-library-staging
+  RELEASE_NAME: book-library-staging
+  STAGING_URL: https://staging-book-library.example.com
+  DOCKER_REGISTRY: docker.io
+  IMAGE_NAME: gwynbliedd/book-library
+  ENABLE_SMOKE_TESTS: ""  # Set to "true" to enable smoke tests
+
+jobs:
+  # ===============================================
+  # JOB: Deploy to Staging Environment
+  # ===============================================
+  deploy-staging:
+    name: Staging Deployment
+    runs-on: self-hosted
+    environment: staging  # Requires approval if configured
+    
+    steps:
+    # ===============================================
+    # STEP 1: Setup and Preparation
+    # ===============================================
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # Determine which image tag to deploy
+    - name: Determine deployment image
+      id: image-tag
+      run: |
+        if [ -n "${{ github.event.inputs.image-tag }}" ]; then
+          # Manual deployment with specific tag
+          IMAGE_TAG="${{ github.event.inputs.image-tag }}"
+          echo "📌 Using manually specified image tag: $IMAGE_TAG"
+        else
+          # For automatic deployment on push, use a unique tag with commit SHA
+          # This ensures we wait for the exact image from this push, not an old one
+          IMAGE_TAG="staging-${{ github.sha }}"
+          echo "🔄 Using commit-specific image tag from CI pipeline: $IMAGE_TAG"
+        fi
+        
+        echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+        echo "🐳 Deploying image: gwynbliedd/book-library:$IMAGE_TAG"
+
+    # ===============================================
+    # STEP 2: Wait for Docker Image Availability
+    # ===============================================
+    # When triggered by push, CI and deployment run in parallel
+    # We need to wait for the CI to build and push the image
+    - name: Wait for Docker image
+      if: github.event_name == 'push'
+      run: |
+        echo "⏳ Waiting for CI pipeline to build and push image..."
+        echo "🔍 Checking for image: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }}"
+        
+        # Maximum wait time: 20 minutes (80 attempts with 15 second intervals)
+        MAX_ATTEMPTS=80
+        ATTEMPT=0
+        
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          ATTEMPT=$((ATTEMPT + 1))
+          echo "Attempt $ATTEMPT of $MAX_ATTEMPTS..."
+          
+          # Check if image exists in registry
+          if docker manifest inspect "${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }}" >/dev/null 2>&1; then
+            echo "✅ Image found! Proceeding with deployment."
+            break
+          fi
+          
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "❌ Timeout waiting for image. CI pipeline may have failed."
+            echo "Please check the CI pipeline status."
+            exit 1
+          fi
+          
+          # Wait 15 seconds before next attempt
+          echo "Image not found yet. Waiting 15 seconds..."
+          sleep 15
+        done
+        
+        # Extra wait to ensure image is fully propagated
+        echo "⏳ Waiting additional 10 seconds for registry propagation..."
+        sleep 10
+
+    # ===============================================
+    # STEP 3: Validation Deployment (Dry Run)
+    # ===============================================
+    # Always perform a dry run first to catch configuration errors
+    - name: Validate deployment configuration
+      uses: ./.github/actions/helm-deploy
+      with:
+        release-name: ${{ env.RELEASE_NAME }}
+        namespace: ${{ env.NAMESPACE }}
+        environment: ${{ env.ENVIRONMENT }}
+        image-tag: ${{ steps.image-tag.outputs.tag }}
+        kubeconfig: ${{ secrets.KUBECONFIG_STAGING }}
+        dry-run: 'true'
+
+    # ===============================================
+    # STEP 4: Execute Deployment
+    # ===============================================
+    - name: Deploy to staging cluster
+      uses: ./.github/actions/helm-deploy
+      with:
+        release-name: ${{ env.RELEASE_NAME }}
+        namespace: ${{ env.NAMESPACE }}
+        environment: ${{ env.ENVIRONMENT }}
+        image-tag: ${{ steps.image-tag.outputs.tag }}
+        kubeconfig: ${{ secrets.KUBECONFIG_STAGING }}
+        dry-run: 'false'
+
+    # ===============================================
+    # STEP 5: Post-Deployment Verification
+    # ===============================================
+    - name: Run smoke tests
+      if: env.ENABLE_SMOKE_TESTS == 'true'
+      run: |
+        echo "🔍 Running smoke tests against staging environment..."
+        echo "⏳ Waiting 30 seconds for application startup..."
+        sleep 30
+        
+        # Test 1: Health check endpoint
+        echo "Testing health endpoint..."
+        if curl -f "${{ env.STAGING_URL }}/actuator/health" --max-time 10; then
+          echo "✅ Health check passed"
+        else
+          echo "❌ Health check failed"
+          exit 1
+        fi
+        
+        # Test 2: API availability
+        echo ""
+        echo "Testing API endpoint..."
+        if curl -f "${{ env.STAGING_URL }}/api/books" --max-time 10; then
+          echo "✅ API check passed"
+        else
+          echo "❌ API check failed"
+          exit 1
+        fi
+        
+        # Test 3: Database connectivity (via health details)
+        echo ""
+        echo "Testing database connectivity..."
+        if curl -sf "${{ env.STAGING_URL }}/actuator/health" | grep -q '"status":"UP"'; then
+          echo "✅ Database connectivity verified"
+        else
+          echo "⚠️  Could not verify database connectivity"
+        fi
+        
+        echo ""
+        echo "🎉 All smoke tests passed!"
+
+    # ===============================================
+    # STEP 6: Record Deployment
+    # ===============================================
+    # Create GitHub deployment record for tracking
+    - name: Create deployment record
+      uses: actions/github-script@v7
+      with:
+        script: |
+          // Create deployment
+          const deployment = await github.rest.repos.createDeployment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            ref: context.sha,
+            environment: 'staging',
+            description: 'Automated staging deployment',
+            auto_merge: false,
+            required_contexts: [],
+            payload: {
+              image_tag: '${{ steps.image-tag.outputs.tag }}',
+              namespace: '${{ env.NAMESPACE }}',
+              triggered_by: '${{ github.event_name }}',
+              actor: '${{ github.actor }}'
+            }
+          });
+          
+          // Mark deployment as successful
+          await github.rest.repos.createDeploymentStatus({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            deployment_id: deployment.data.id,
+            state: 'success',
+            environment_url: '${{ env.STAGING_URL }}',
+            description: 'Deployment completed successfully'
+          });
+          
+          console.log('✅ Deployment record created');
+
+    # ===============================================
+    # STEP 7: Output Summary
+    # ===============================================
+    - name: Deployment summary
+      if: success()
+      run: |
+        echo "# 🚀 Staging Deployment Successful!"
+        echo ""
+        echo "## Deployment Details"
+        echo "- **Environment**: Staging"
+        echo "- **Namespace**: ${{ env.NAMESPACE }}"
+        echo "- **Release**: ${{ env.RELEASE_NAME }}"
+        echo "- **Image**: gwynbliedd/book-library:${{ steps.image-tag.outputs.tag }}"
+        echo "- **URL**: ${{ env.STAGING_URL }}"
+        echo ""
+        echo "## Next Steps"
+        echo "1. Verify application functionality at ${{ env.STAGING_URL }}"
+        echo "2. Run integration tests if needed"
+        echo "3. If everything looks good, create PR to main branch"
+        echo ""
+        echo "---"
+        echo "_Deployment completed at $(date)_"

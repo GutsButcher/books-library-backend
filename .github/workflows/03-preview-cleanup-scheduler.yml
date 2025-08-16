@@ -1,0 +1,238 @@
+# ===============================================
+# SCHEDULED PREVIEW CLEANUP WORKFLOW
+# ===============================================
+# This workflow runs on a schedule to clean up stale preview environments
+# that may have been missed during normal PR closure.
+#
+# Purpose:
+# - Prevents resource leaks from forgotten preview environments
+# - Cleans up previews from PRs closed more than 7 days ago
+# - Creates audit reports of cleanup activities
+#
+# Schedule: Daily at 2 AM UTC
+# Can also be triggered manually via workflow_dispatch
+# ===============================================
+
+name: 03 - Preview Cleanup Scheduler
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC (adjust based on your team's timezone)
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # Allow manual triggering for immediate cleanup
+
+# Minimal permissions needed for cleanup operations
+permissions:
+  contents: read       # Read repository information
+  issues: write        # Create/update cleanup report issues
+  pull-requests: read  # Read PR information
+
+# Configuration
+env:
+  STALE_THRESHOLD_DAYS: 7  # Clean up previews older than this many days
+
+jobs:
+  # ===============================================
+  # JOB: Find and Remove Stale Preview Environments
+  # ===============================================
+  stale-preview-cleanup:
+    name: Cleanup Abandoned Previews
+    runs-on: self-hosted  # Requires kubectl and helm
+    
+    steps:
+    # ===============================================
+    # STEP 1: Identify Stale Preview Environments
+    # ===============================================
+    - name: Find stale preview environments
+      id: find-stale
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const staleThresholdDays = parseInt('${{ env.STALE_THRESHOLD_DAYS }}');
+          const now = new Date();
+          
+          console.log(`🔍 Searching for preview environments older than ${staleThresholdDays} days...`);
+          
+          // Fetch closed PRs (limited to last 100 for performance)
+          const { data: closedPRs } = await github.rest.pulls.list({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            state: 'closed',
+            sort: 'updated',
+            direction: 'desc',
+            per_page: 100
+          });
+          
+          // Filter for stale previews:
+          // - PR had pr-deploy label
+          // - Closed more than threshold days ago
+          const stalePRs = closedPRs.filter(pr => {
+            const closedAt = new Date(pr.closed_at);
+            const daysSinceClosed = (now - closedAt) / (1000 * 60 * 60 * 24);
+            
+            const hasDeployLabel = pr.labels.some(label => label.name === 'pr-deploy');
+            const isStale = daysSinceClosed > staleThresholdDays;
+            
+            if (hasDeployLabel && isStale) {
+              console.log(`Found stale PR #${pr.number} - closed ${Math.floor(daysSinceClosed)} days ago`);
+            }
+            
+            return hasDeployLabel && isStale;
+          });
+          
+          console.log(`📊 Found ${stalePRs.length} stale preview environments`);
+          
+          // Prepare cleanup information
+          const cleanupTargets = stalePRs.map(pr => ({
+            number: pr.number,
+            title: pr.title,
+            closedAt: pr.closed_at,
+            closedBy: pr.user.login,
+            daysSinceClosed: Math.floor((now - new Date(pr.closed_at)) / (1000 * 60 * 60 * 24)),
+            namespace: `book-library-pr-${pr.number}`,
+            releaseName: `book-library-pr-${pr.number}`
+          }));
+          
+          // Output for next steps
+          core.setOutput('stale-prs', JSON.stringify(cleanupTargets));
+          core.setOutput('count', cleanupTargets.length.toString());
+
+    # ===============================================
+    # STEP 2: Execute Cleanup Operations
+    # ===============================================
+    - name: Remove stale Kubernetes resources
+      if: steps.find-stale.outputs.count > 0
+      run: |
+        echo "🧹 Starting cleanup of ${{ steps.find-stale.outputs.count }} stale preview environments..."
+        
+        # Parse the JSON output from previous step
+        STALE_PRS='${{ steps.find-stale.outputs.stale-prs }}'
+        
+        # Process each stale preview
+        echo "$STALE_PRS" | jq -r '.[] | "\(.namespace) \(.releaseName) \(.number)"' | while read namespace releaseName prNumber; do
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔧 Cleaning up PR #${prNumber}"
+          echo "   Namespace: ${namespace}"
+          echo "   Release: ${releaseName}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          # Uninstall Helm release
+          echo "📦 Removing Helm release..."
+          if helm list -n "$namespace" | grep -q "$releaseName"; then
+            helm uninstall "$releaseName" -n "$namespace" --wait=false
+            echo "✅ Helm release removed"
+          else
+            echo "⚠️  Helm release not found (may have been manually deleted)"
+          fi
+          
+          # Delete namespace
+          echo "🗑️  Removing namespace..."
+          if kubectl get namespace "$namespace" >/dev/null 2>&1; then
+            kubectl delete namespace "$namespace" --wait=false
+            echo "✅ Namespace deletion initiated"
+          else
+            echo "⚠️  Namespace not found (may have been manually deleted)"
+          fi
+          
+          echo "✨ Cleanup completed for PR #${prNumber}"
+        done
+        
+        echo ""
+        echo "🎉 All stale preview environments have been cleaned up!"
+
+    # ===============================================
+    # STEP 3: Generate Cleanup Report
+    # ===============================================
+    - name: Create or update cleanup report
+      if: steps.find-stale.outputs.count > 0
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const stalePRs = JSON.parse('${{ steps.find-stale.outputs.stale-prs }}');
+          const now = new Date();
+          
+          // Generate detailed report
+          const reportBody = `## 🧹 Automated Preview Cleanup Report
+          
+          **Execution Time**: ${now.toISOString()}
+          **Cleanup Policy**: Remove previews from PRs closed more than ${{ env.STALE_THRESHOLD_DAYS }} days ago
+          **Total Cleaned**: ${stalePRs.length} preview environment(s)
+          
+          ### Cleanup Details
+          
+          | PR | Title | Closed By | Days Since Closed | Status |
+          |:---:|:------|:----------|:----------------:|:------:|
+          ${stalePRs.map(pr => 
+            `| #${pr.number} | ${pr.title.substring(0, 40)}${pr.title.length > 40 ? '...' : ''} | @${pr.closedBy} | ${pr.daysSinceClosed} | ✅ Cleaned |`
+          ).join('\n')}
+          
+          ### Resources Reclaimed
+          - **Namespaces**: ${stalePRs.length}
+          - **Helm Releases**: ${stalePRs.length}
+          - **Estimated Resources**: ~${stalePRs.length * 512}Mi memory, ~${stalePRs.length * 500}m CPU
+          
+          ---
+          
+          <details>
+          <summary>📋 Cleanup Commands Used</summary>
+          
+          \`\`\`bash
+          ${stalePRs.map(pr => 
+            `helm uninstall ${pr.releaseName} -n ${pr.namespace}
+          kubectl delete namespace ${pr.namespace}`
+          ).join('\n')}
+          \`\`\`
+          
+          </details>
+          
+          _This is an automated cleanup performed by the scheduled workflow._
+          _Next run: Tomorrow at 2 AM UTC_`;
+          
+          // Check for existing open cleanup report issue
+          const { data: issues } = await github.rest.issues.listForRepo({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            labels: 'cleanup-report',
+            state: 'open'
+          });
+          
+          if (issues.length > 0) {
+            // Add comment to existing issue
+            console.log(`📝 Adding cleanup report to existing issue #${issues[0].number}`);
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issues[0].number,
+              body: reportBody
+            });
+          } else {
+            // Create new issue for cleanup reports
+            console.log('📝 Creating new cleanup report issue');
+            const { data: newIssue } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🧹 Preview Environment Cleanup Reports',
+              body: `This issue tracks automated cleanup of stale preview environments.
+              
+              New reports will be added as comments below.
+              
+              ${reportBody}`,
+              labels: ['cleanup-report', 'automation', 'infrastructure']
+            });
+            console.log(`✅ Created cleanup report issue #${newIssue.number}`);
+          }
+
+    # ===============================================
+    # STEP 4: No Cleanup Needed Notification
+    # ===============================================
+    - name: Log when no cleanup needed
+      if: steps.find-stale.outputs.count == 0
+      run: |
+        echo "✨ No stale preview environments found!"
+        echo "All preview environments are either:"
+        echo "  - Still active (PR is open)"
+        echo "  - Recently closed (within ${{ env.STALE_THRESHOLD_DAYS }} days)"
+        echo "  - Already cleaned up"

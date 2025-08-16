@@ -1,0 +1,429 @@
+# ===============================================
+# PULL REQUEST PREVIEW DEPLOYMENT PIPELINE
+# ===============================================
+# This workflow manages ephemeral preview environments for pull requests.
+# 
+# Features:
+# - Deploy preview environments on-demand (via label or /deploy comment)
+# - Limit concurrent preview deployments (default: 3)
+# - Resource limits for preview environments
+# - Automatic cleanup when PR is closed or label is removed
+# - Helpful comments on PR for deployment status
+#
+# Prerequisites:
+# - Self-hosted runner with helm and kubectl
+# - pr-deploy label to trigger deployments
+# ===============================================
+
+name: 02 - Pull Request Preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed, labeled, unlabeled]
+    branches: [dev, staging]
+  issue_comment:
+    types: [created]
+
+# Required permissions for PR interactions
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+# Configuration for preview environments
+env:
+  DOCKER_REGISTRY: docker.io
+  IMAGE_NAME: gwynbliedd/book-library
+  MAX_CONCURRENT_PREVIEWS: 3              # Maximum number of active preview environments
+  PR_PREVIEW_CPU_REQUEST: 100m            # Minimum CPU for preview
+  PR_PREVIEW_CPU_LIMIT: 500m              # Maximum CPU for preview
+  PR_PREVIEW_MEMORY_REQUEST: 256Mi        # Minimum memory for preview
+  PR_PREVIEW_MEMORY_LIMIT: 512Mi          # Maximum memory for preview
+
+jobs:
+  # ===============================================
+  # JOB 1: Enforce Concurrent Deployment Limits
+  # ===============================================
+  # Prevents resource exhaustion by limiting active previews
+  enforce-preview-limits:
+    name: Validate Preview Capacity
+    runs-on: ubuntu-latest
+    # Only check for non-draft PRs with pr-deploy label
+    if: |
+      github.event.pull_request.draft == false && 
+      github.event.action != 'closed' && 
+      contains(github.event.pull_request.labels.*.name, 'pr-deploy')
+    outputs:
+      can-deploy: ${{ steps.check.outputs.can-deploy }}
+      active-count: ${{ steps.check.outputs.active-count }}
+    
+    steps:
+    # Count active preview deployments and check against limit
+    - name: Count active preview environments
+      id: check
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          // Fetch all open PRs with pr-deploy label
+          const { data: prs } = await github.rest.pulls.list({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            state: 'open',
+            per_page: 100
+          });
+          
+          // Count PRs with active deployments (excluding current PR)
+          const activePRs = prs.filter(pr => 
+            pr.number !== context.payload.pull_request.number &&
+            pr.labels.some(label => label.name === 'pr-deploy')
+          );
+          
+          const activeCount = activePRs.length;
+          const maxConcurrent = parseInt('${{ env.MAX_CONCURRENT_PREVIEWS }}');
+          const canDeploy = activeCount < maxConcurrent;
+          
+          console.log(`📊 Active preview deployments: ${activeCount}/${maxConcurrent}`);
+          console.log(`✅ Can deploy: ${canDeploy}`);
+          
+          core.setOutput('can-deploy', canDeploy);
+          core.setOutput('active-count', activeCount);
+          
+          // Post comment if limit reached
+          if (!canDeploy) {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: `⚠️ **Preview Deployment Limit Reached**
+              
+              Maximum concurrent preview deployments (${maxConcurrent}) has been reached.
+              Currently active: ${activeCount} preview environments.
+              
+              To proceed:
+              - Wait for another PR to be closed
+              - Remove the \`pr-deploy\` label from other PRs
+              - Contact DevOps team to increase the limit`
+            });
+          }
+
+  # ===============================================
+  # JOB 2: Build Preview Environment
+  # ===============================================
+  # Builds the application and Docker image for preview
+  build-preview:
+    name: Build Preview Image
+    runs-on: ubuntu-latest
+    needs: enforce-preview-limits
+    # Only proceed if within deployment limits
+    if: |
+      needs.enforce-preview-limits.outputs.can-deploy == 'true' &&
+      github.event.pull_request.draft == false && 
+      github.event.action != 'closed' && 
+      contains(github.event.pull_request.labels.*.name, 'pr-deploy')
+    outputs:
+      release-name: ${{ steps.preview.outputs.release-name }}
+      namespace: ${{ steps.preview.outputs.namespace }}
+      short-sha: ${{ steps.short-sha.outputs.sha }}
+      pr-number: ${{ github.event.pull_request.number }}
+    
+    steps:
+    - name: Checkout PR code
+      uses: actions/checkout@v4
+        
+    # Generate consistent naming for preview resources
+    - name: Generate preview identifiers
+      id: preview
+      run: |
+        PR_NUMBER=${{ github.event.pull_request.number }}
+        NAMESPACE="book-library-pr-${PR_NUMBER}"
+        RELEASE_NAME="book-library-pr-${PR_NUMBER}"
+        echo "namespace=${NAMESPACE}" >> $GITHUB_OUTPUT
+        echo "release-name=${RELEASE_NAME}" >> $GITHUB_OUTPUT
+        echo "🏷️ Preview namespace: ${NAMESPACE}"
+
+    - name: Setup build environment
+      uses: ./.github/actions/setup-java-maven
+      with:
+        java-version: '17'
+
+    - name: Build application JAR
+      run: mvn clean package -DskipTests
+
+    # Generate short SHA for tagging
+    - name: Generate short commit SHA
+      id: short-sha
+      run: |
+        SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
+        echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+        echo "🔤 Short SHA: ${SHORT_SHA}"
+      
+    # Build preview-specific Docker image
+    - name: Build and push preview image
+      id: docker-build
+      uses: ./.github/actions/docker-build-push
+      with:
+        registry: ${{ env.DOCKER_REGISTRY }}
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_TOKEN }}
+        image-name: ${{ env.IMAGE_NAME }}
+        push: true
+        extra-tags: pr-${{ github.event.pull_request.number }}-${{ steps.short-sha.outputs.sha }}
+
+  # ===============================================
+  # JOB 3: Deploy Preview Environment
+  # ===============================================
+  # Deploys the preview to Kubernetes cluster
+  deploy-preview:
+    name: Deploy to Kubernetes
+    runs-on: self-hosted  # Requires helm and kubectl
+    needs: [enforce-preview-limits, build-preview]
+    if: |
+      needs.enforce-preview-limits.outputs.can-deploy == 'true' &&
+      github.event.pull_request.draft == false && 
+      github.event.action != 'closed' && 
+      contains(github.event.pull_request.labels.*.name, 'pr-deploy')
+    
+    steps:
+    # Verify self-hosted runner environment
+    - name: Validate runner environment
+      run: |
+        echo "🔍 Checking runner tools..."
+        echo "OS: $RUNNER_OS"
+        echo "Arch: $RUNNER_ARCH"
+        command -v helm >/dev/null 2>&1 || { echo "❌ helm is required but not installed."; exit 1; }
+        command -v kubectl >/dev/null 2>&1 || { echo "❌ kubectl is required but not installed."; exit 1; }
+        echo "✅ All required tools present"
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    # Deploy with resource limits
+    - name: Deploy preview environment
+      uses: ./.github/actions/helm-deploy
+      with:
+        release-name: ${{ needs.build-preview.outputs.release-name }}
+        namespace: ${{ needs.build-preview.outputs.namespace }}
+        environment: dev  # Use dev values as base
+        image-tag: pr-${{ github.event.pull_request.number }}-${{ needs.build-preview.outputs.short-sha }}
+        timeout: 5m
+        extra-values: |
+          --set=resources.requests.cpu=${{ env.PR_PREVIEW_CPU_REQUEST }}
+          --set=resources.requests.memory=${{ env.PR_PREVIEW_MEMORY_REQUEST }}
+          --set=resources.limits.cpu=${{ env.PR_PREVIEW_CPU_LIMIT }}
+          --set=resources.limits.memory=${{ env.PR_PREVIEW_MEMORY_LIMIT }}
+  
+  # ===============================================
+  # JOB 4: Post Deployment Status
+  # ===============================================
+  # Adds helpful comment to PR with deployment details
+  notify-deployment-success:
+    name: Update PR Status
+    runs-on: ubuntu-latest
+    needs: [enforce-preview-limits, build-preview, deploy-preview]
+    if: |
+      always() &&
+      needs.enforce-preview-limits.outputs.can-deploy == 'true' &&
+      github.event.pull_request.draft == false && 
+      github.event.action != 'closed' && 
+      contains(github.event.pull_request.labels.*.name, 'pr-deploy')
+    
+    steps:
+    - name: Post deployment details to PR
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const prNumber = context.payload.pull_request.number;
+          const namespace = '${{ needs.build-preview.outputs.namespace }}';
+          
+          const comment = `## 🚀 Preview Environment Deployed!
+          
+          Your changes have been deployed to a preview environment:
+          
+          📋 **Deployment Details**
+          - **Namespace**: \`${namespace}\`
+          - **Release**: \`${{ needs.build-preview.outputs.release-name }}\`
+          - **Image**: \`pr-${prNumber}-${{ needs.build-preview.outputs.short-sha }}\`
+          
+          ⚙️ **Resource Allocation**
+          - **CPU**: ${{ env.PR_PREVIEW_CPU_REQUEST }} (request) / ${{ env.PR_PREVIEW_CPU_LIMIT }} (limit)
+          - **Memory**: ${{ env.PR_PREVIEW_MEMORY_REQUEST }} (request) / ${{ env.PR_PREVIEW_MEMORY_LIMIT }} (limit)
+          
+          🧹 **Cleanup Policy**
+          Preview will be automatically removed when:
+          - PR is closed
+          - \`pr-deploy\` label is removed
+          - 7 days after PR closure (scheduled cleanup)`;
+          
+          github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber,
+            body: comment
+          });
+
+  # ===============================================
+  # JOB 5: Helpful Instructions for New PRs
+  # ===============================================
+  # Provides deployment instructions when PR is opened without label
+  provide-deployment-instructions:
+    name: Post Deployment Guide
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'pull_request' && 
+      github.event.action == 'opened' && 
+      github.event.pull_request.draft == false && 
+      !contains(github.event.pull_request.labels.*.name, 'pr-deploy')
+    
+    steps:
+    - name: Add deployment instructions comment
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const comment = `## 🚀 Preview Deployment Available
+          
+          You can deploy a preview environment for testing your changes.
+          
+          **To deploy a preview:**
+          1. Add the \`pr-deploy\` label to this PR
+          2. Or comment \`/deploy\` (authorized users only)
+          
+          **Preview features:**
+          - Isolated environment for testing
+          - Automatic cleanup on PR closure
+          - Resource limits to prevent overuse
+          
+          **Note:** Only ${process.env.MAX_CONCURRENT_PREVIEWS} concurrent previews are allowed.`;
+          
+          github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.payload.pull_request.number,
+            body: comment
+          });
+
+  # ===============================================
+  # JOB 6: Handle /deploy Commands
+  # ===============================================
+  # Allows authorized users to deploy via comments
+  handle-deploy-command:
+    name: Process Deploy Commands
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/deploy') &&
+      (github.event.comment.author_association == 'OWNER' || 
+       github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR')
+    
+    steps:
+    # Debug information for troubleshooting
+    - name: Validate command context
+      run: |
+        echo "📝 Comment: ${{ github.event.comment.body }}"
+        echo "👤 Author: ${{ github.event.comment.user.login }}"
+        echo "🔑 Association: ${{ github.event.comment.author_association }}"
+        
+    # Add label to trigger deployment
+    - name: Trigger preview deployment
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const prNumber = context.issue.number;
+          
+          // Add pr-deploy label to trigger deployment
+          await github.rest.issues.addLabels({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber,
+            labels: ['pr-deploy']
+          });
+          
+          // Acknowledge command
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber,
+            body: '🚀 Preview deployment initiated by @' + context.actor + '\n\nPlease wait while the environment is being prepared...'
+          });
+
+  # ===============================================
+  # JOB 7: Cleanup Preview Environments
+  # ===============================================
+  # Removes preview when PR is closed or label removed
+  cleanup-preview:
+    name: Remove Preview Environment
+    runs-on: self-hosted
+    if: |
+      github.event_name == 'pull_request' && 
+      (
+        (github.event.action == 'closed' && contains(github.event.pull_request.labels.*.name, 'pr-deploy')) ||
+        (github.event.action == 'unlabeled' && github.event.label.name == 'pr-deploy')
+      )
+    
+    steps:
+    # Generate resource names for cleanup
+    - name: Prepare cleanup identifiers
+      id: preview-info
+      run: |
+        PR_NUMBER=${{ github.event.pull_request.number }}
+        NAMESPACE="book-library-pr-${PR_NUMBER}"
+        RELEASE_NAME="book-library-pr-${PR_NUMBER}"
+        echo "namespace=${NAMESPACE}" >> $GITHUB_OUTPUT
+        echo "release-name=${RELEASE_NAME}" >> $GITHUB_OUTPUT
+        echo "🧹 Cleaning up preview for PR #${PR_NUMBER}"
+        
+    # Remove Helm release and namespace
+    - name: Delete preview resources
+      run: |
+        echo "📦 Uninstalling Helm release..."
+        helm uninstall ${{ steps.preview-info.outputs.release-name }} \
+          -n ${{ steps.preview-info.outputs.namespace }} || echo "Release not found"
+        
+        echo "🗑️ Deleting namespace..."
+        kubectl delete namespace ${{ steps.preview-info.outputs.namespace }} \
+          --wait=false || echo "Namespace not found"
+  
+  # ===============================================
+  # JOB 8: Notify Cleanup Completion
+  # ===============================================
+  # Posts final comment when preview is removed
+  notify-cleanup-complete:
+    name: Post Cleanup Status
+    runs-on: ubuntu-latest
+    needs: cleanup-preview
+    if: |
+      github.event_name == 'pull_request' && 
+      (
+        (github.event.action == 'closed' && contains(github.event.pull_request.labels.*.name, 'pr-deploy')) ||
+        (github.event.action == 'unlabeled' && github.event.label.name == 'pr-deploy')
+      )
+    
+    steps:
+    - name: Post cleanup confirmation
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const prNumber = context.payload.pull_request.number;
+          const action = context.payload.action;
+          
+          let reason = action === 'closed' ? 'PR closure' : 'label removal';
+          
+          const comment = `## 🧹 Preview Environment Removed
+          
+          The preview deployment for PR #${prNumber} has been cleaned up due to ${reason}.
+          
+          All associated resources have been deleted.`;
+          
+          github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber,
+            body: comment
+          });

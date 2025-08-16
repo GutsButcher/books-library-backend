@@ -1,0 +1,34 @@
+{{- if .Values.configMap.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "book-library.fullname" . }}
+  labels:
+    {{- include "book-library.labels" . | nindent 4 }}
+data:
+  {{- if .Values.configMap.data }}
+  {{- toYaml .Values.configMap.data | nindent 2 }}
+  {{- end }}
+  application-kubernetes.yaml: |
+    spring:
+      application:
+        name: {{ include "book-library.name" . }}
+      profiles:
+        active: kubernetes
+    server:
+      port: {{ .Values.app.port }}
+    management:
+      endpoints:
+        web:
+          exposure:
+            include: health,info,metrics,prometheus
+      endpoint:
+        health:
+          show-details: always
+          probes:
+            enabled: true
+    logging:
+      level:
+        root: INFO
+        com.example.booklibrary: DEBUG
+{{- end }}
