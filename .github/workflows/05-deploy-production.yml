@@ -98,7 +98,48 @@ jobs:
         echo "✅ Runner environment validated"
 
     # ===============================================
-    # STEP 2: Pre-Deployment Backup
+    # STEP 2: Wait for Docker Image Availability
+    # ===============================================
+    # When triggered by push, CI and deployment run in parallel
+    # We need to wait for the CI to build and push the image
+    - name: Wait for production image
+      if: github.event_name == 'push'
+      run: |
+        echo "⏳ Waiting for CI pipeline to build and push production image..."
+        echo "🔍 Checking for image: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }}"
+        
+        # Maximum wait time: 25 minutes (100 attempts with 15 second intervals)
+        # Production CI may take longer due to additional checks
+        MAX_ATTEMPTS=100
+        ATTEMPT=0
+        
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          ATTEMPT=$((ATTEMPT + 1))
+          echo "Attempt $ATTEMPT of $MAX_ATTEMPTS..."
+          
+          # Check if image exists in registry
+          if docker manifest inspect "${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }}" >/dev/null 2>&1; then
+            echo "✅ Production image found! Proceeding with deployment."
+            break
+          fi
+          
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "❌ Timeout waiting for production image. CI pipeline may have failed."
+            echo "Please check the CI pipeline status."
+            exit 1
+          fi
+          
+          # Wait 15 seconds before next attempt
+          echo "Image not found yet. Waiting 15 seconds..."
+          sleep 15
+        done
+        
+        # Extra wait to ensure image is fully propagated
+        echo "⏳ Waiting additional 20 seconds for registry propagation..."
+        sleep 20
+
+    # ===============================================
+    # STEP 3: Pre-Deployment Backup
     # ===============================================
     - name: Create production backup
       id: backup
@@ -133,7 +174,7 @@ jobs:
         echo "✅ Backup completed: $BACKUP_DIR"
 
     # ===============================================
-    # STEP 3: Deployment Validation (Dry Run)
+    # STEP 4: Deployment Validation (Dry Run)
     # ===============================================
     - name: Validate deployment manifest
       shell: bash
@@ -158,7 +199,7 @@ jobs:
         echo "✅ Deployment validation passed"
 
     # ===============================================
-    # STEP 4: Execute Production Deployment
+    # STEP 5: Execute Production Deployment
     # ===============================================
     - name: Deploy to production
       shell: bash
@@ -180,7 +221,7 @@ jobs:
         echo "✅ Helm deployment completed"
 
     # ===============================================
-    # STEP 5: Deployment Verification
+    # STEP 6: Deployment Verification
     # ===============================================
     - name: Verify deployment health
       run: |
@@ -216,7 +257,7 @@ jobs:
         echo "✅ All pods are healthy"
 
     # ===============================================
-    # STEP 6: Production Smoke Tests
+    # STEP 7: Production Smoke Tests
     # ===============================================
     - name: Execute production tests
       run: |
@@ -268,7 +309,7 @@ jobs:
         echo -e "\n🎉 All production tests passed!"
 
     # ===============================================
-    # STEP 7: Create Deployment Record
+    # STEP 8: Create Deployment Record
     # ===============================================
     - name: Record deployment in GitHub
       uses: actions/github-script@v7
@@ -307,7 +348,7 @@ jobs:
           console.log('✅ Deployment record created');
 
     # ===============================================
-    # STEP 8: Notifications
+    # STEP 9: Notifications
     # ===============================================
     - name: Send deployment notification
       if: always()
