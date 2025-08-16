@@ -94,7 +94,6 @@ jobs:
         echo "📦 Tool versions:"
         kubectl version --client 
         helm version  --short
-        
         # Verify cluster connectivity
         echo "🔗 Verifying cluster access..."
         kubectl cluster-info
