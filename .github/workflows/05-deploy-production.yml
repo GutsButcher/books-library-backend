@@ -40,6 +40,8 @@ env:
   RELEASE_NAME: book-library
   PROD_URL: https://book-library.example.com
   BACKUP_RETENTION_DAYS: 30
+  DOCKER_REGISTRY: docker.io
+  IMAGE_NAME: gwynbliedd/book-library
 
 jobs:
   # ===============================================

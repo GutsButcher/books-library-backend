@@ -37,6 +37,8 @@ env:
   NAMESPACE: book-library-staging
   RELEASE_NAME: book-library-staging
   STAGING_URL: https://staging-book-library.example.com
+  DOCKER_REGISTRY: docker.io
+  IMAGE_NAME: gwynbliedd/book-library
 
 jobs:
   # ===============================================
