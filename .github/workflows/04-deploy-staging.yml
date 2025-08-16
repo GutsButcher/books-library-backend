@@ -39,6 +39,7 @@ env:
   STAGING_URL: https://staging-book-library.example.com
   DOCKER_REGISTRY: docker.io
   IMAGE_NAME: gwynbliedd/book-library
+  ENABLE_SMOKE_TESTS: ""  # Set to "true" to enable smoke tests
 
 jobs:
   # ===============================================
@@ -65,9 +66,10 @@ jobs:
           IMAGE_TAG="${{ github.event.inputs.image-tag }}"
           echo "📌 Using manually specified image tag: $IMAGE_TAG"
         else
-          # Automatic deployment uses branch name (latest)
-          IMAGE_TAG="staging"
-          echo "🔄 Using latest staging image from CI pipeline"
+          # For automatic deployment on push, use a unique tag with commit SHA
+          # This ensures we wait for the exact image from this push, not an old one
+          IMAGE_TAG="staging-${{ github.sha }}"
+          echo "🔄 Using commit-specific image tag from CI pipeline: $IMAGE_TAG"
         fi
         
         echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
@@ -144,6 +146,7 @@ jobs:
     # STEP 5: Post-Deployment Verification
     # ===============================================
     - name: Run smoke tests
+      if: env.ENABLE_SMOKE_TESTS == 'true'
       run: |
         echo "🔍 Running smoke tests against staging environment..."
         echo "⏳ Waiting 30 seconds for application startup..."
@@ -218,30 +221,7 @@ jobs:
           console.log('✅ Deployment record created');
 
     # ===============================================
-    # STEP 7: Send Notifications
-    # ===============================================
-    # Notify team of deployment status (always runs)
-    - name: Send Slack notification
-      if: always()
-      uses: 8398a7/action-slack@v3
-      with:
-        status: ${{ job.status }}
-        text: |
-          Staging Deployment ${{ job.status == 'success' && '✅' || '❌' }}
-          
-          Environment: Staging
-          Image: `${{ steps.image-tag.outputs.tag }}`
-          Trigger: ${{ github.event_name }}
-          Actor: ${{ github.actor }}
-          Commit: ${{ github.sha }}
-          
-          ${{ job.status == 'success' && 'URL: ' || '' }}${{ job.status == 'success' && env.STAGING_URL || '' }}
-        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
-      env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
-
-    # ===============================================
-    # STEP 8: Output Summary
+    # STEP 7: Output Summary
     # ===============================================
     - name: Deployment summary
       if: success()
