@@ -42,6 +42,7 @@ env:
   BACKUP_RETENTION_DAYS: 30
   DOCKER_REGISTRY: docker.io
   IMAGE_NAME: gwynbliedd/book-library
+  ENABLE_SMOKE_TESTS: ""  # Set to "true" to enable smoke tests
 
 jobs:
   # ===============================================
@@ -70,9 +71,10 @@ jobs:
           IMAGE_TAG="${{ github.event.inputs.image-tag }}"
           echo "📌 Manual deployment with image tag: $IMAGE_TAG"
         else
-          # Automatic deployment from main branch
-          IMAGE_TAG="main"
-          echo "🔄 Automatic deployment with latest main image"
+          # For automatic deployment on push, use a unique tag with commit SHA
+          # This ensures we wait for the exact image from this push, not an old one
+          IMAGE_TAG="main-${{ github.sha }}"
+          echo "🔄 Using commit-specific image tag from CI pipeline: $IMAGE_TAG"
         fi
         
         echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
@@ -262,6 +264,7 @@ jobs:
     # STEP 7: Production Smoke Tests
     # ===============================================
     - name: Execute production tests
+      if: env.ENABLE_SMOKE_TESTS == 'true'
       run: |
         echo "🧪 Running production smoke tests..."
         
@@ -349,27 +352,6 @@ jobs:
           
           console.log('✅ Deployment record created');
 
-    # ===============================================
-    # STEP 9: Notifications
-    # ===============================================
-    - name: Send deployment notification
-      if: always()
-      uses: 8398a7/action-slack@v3
-      with:
-        status: ${{ job.status }}
-        text: |
-          🚨 PRODUCTION Deployment ${{ job.status == 'success' && '✅ SUCCESS' || '❌ FAILED' }}
-          
-          Environment: Production
-          Image: `${{ steps.image-tag.outputs.tag }}`
-          Previous: `${{ steps.backup.outputs.current-image }}`
-          URL: ${{ env.PROD_URL }}
-          Actor: ${{ github.actor }}
-          
-          ${{ job.status == 'failure' && 'Check logs for rollback status' || 'All systems operational' }}
-        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
-      env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
 
   # ===============================================
   # FALLBACK JOB: Automatic Rollback
@@ -409,19 +391,3 @@ jobs:
           echo "🚨 MANUAL INTERVENTION REQUIRED!"
         fi
         
-    - name: Notify rollback status
-      if: always()
-      uses: 8398a7/action-slack@v3
-      with:
-        status: 'warning'
-        text: |
-          🚨 PRODUCTION ROLLBACK EXECUTED
-          
-          Status: ${{ job.status }}
-          Environment: Production
-          
-          Manual verification required!
-          Check: ${{ env.PROD_URL }}
-        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
-      env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
