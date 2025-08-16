@@ -21,6 +21,10 @@ inputs:
     description: 'Perform a dry run'
     required: false
     default: 'false'
+  extra-values:
+    description: 'Additional helm values to pass'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -57,6 +61,16 @@ runs:
         if [ "${{ inputs.dry-run }}" == "true" ]; then
           HELM_ARGS+=("--dry-run")
           HELM_ARGS+=("--debug")
+        fi
+        
+        # Add extra values if provided
+        if [ -n "${{ inputs.extra-values }}" ]; then
+          # Read extra values line by line and add them to HELM_ARGS
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then
+              HELM_ARGS+=("$line")
+            fi
+          done <<< "${{ inputs.extra-values }}"
         fi
         
         helm "${HELM_ARGS[@]}"

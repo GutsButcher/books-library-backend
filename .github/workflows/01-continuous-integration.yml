@@ -1,0 +1,199 @@
+# ===============================================
+# CONTINUOUS INTEGRATION PIPELINE
+# ===============================================
+# This workflow handles the complete CI process including:
+# - Running tests on all code changes
+# - Building the application JAR
+# - Creating and pushing Docker images
+# - Triggering deployments for staging and production branches
+#
+# Workflow triggers:
+# - Push to dev, staging, or main branches
+# - Pull requests targeting these branches
+# - Manual workflow dispatch
+# ===============================================
+
+name: 01 - Continuous Integration
+
+on:
+  push:
+    branches: [ dev, staging, main ]
+  pull_request:
+    branches: [ dev, staging, main ]
+  workflow_dispatch:
+
+# Global environment variables used across all jobs
+env:
+  JAVA_VERSION: '17'
+  DOCKER_REGISTRY: docker.io
+  IMAGE_NAME: gwynbliedd/book-library
+
+jobs:
+  # ===============================================
+  # JOB 1: Unit & Integration Testing
+  # ===============================================
+  # Runs Maven tests to ensure code quality
+  # This job runs on every trigger (including PRs)
+  unit-tests:
+    name: Unit & Integration Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    # Checkout the repository code
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    # Setup Java and Maven with caching for faster builds
+    - name: Setup build environment
+      uses: ./.github/actions/setup-java-maven
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+
+    # Execute all tests
+    - name: Execute Maven tests
+      run: mvn clean test
+
+  # ===============================================
+  # JOB 2: Build Application JAR
+  # ===============================================
+  # Compiles the application and creates the JAR artifact
+  # Only runs if tests pass
+  compile-application:
+    name: Compile & Package JAR
+    runs-on: ubuntu-latest
+    needs: unit-tests  # Only run if tests pass
+    
+    # Export version for use in Docker tagging
+    outputs:
+      artifact-version: ${{ steps.version.outputs.version }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup build environment
+      uses: ./.github/actions/setup-java-maven
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+
+    # Extract version from pom.xml for Docker tagging
+    - name: Extract application version
+      id: version
+      run: |
+        VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "📦 Application version: $VERSION"
+
+    # Build the application (skip tests as they already ran)
+    - name: Build application JAR
+      run: mvn clean package -DskipTests
+
+    # Upload JAR for Docker build job
+    - name: Store JAR artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: app-jar
+        path: target/*.jar
+
+  # ===============================================
+  # JOB 3: Build & Push Docker Image
+  # ===============================================
+  # Creates Docker images with appropriate tags
+  # Only runs on branch pushes (not PRs)
+  containerize:
+    name: Build & Push Container
+    runs-on: ubuntu-latest
+    needs: compile-application
+    # Skip this job for pull requests
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    outputs:
+      image-tag: ${{ steps.docker-build.outputs.image-tag }}
+      image-digest: ${{ steps.docker-build.outputs.image-digest }}
+      full-image-tag: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # Retrieve the JAR file from previous job
+    - name: Retrieve JAR artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: app-jar
+        path: target/
+
+    # Build and push Docker image with multiple tags
+    # Tags differ based on branch:
+    # - All branches: <branch-name>, <branch-name>-<version>-<sha>
+    # - Main only: Additional prod-<version>-<sha>, v<version>, latest
+    - name: Build and push container image
+      id: docker-build
+      uses: ./.github/actions/docker-build-push
+      with:
+        registry: ${{ env.DOCKER_REGISTRY }}
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+        image-name: ${{ env.IMAGE_NAME }}
+        push: ${{ github.event_name == 'push' }}
+        extra-tags: |
+          ${{ github.ref_name }}-${{ needs.compile-application.outputs.artifact-version }}-${{ github.sha }}
+          ${{ github.ref_name == 'main' && format('prod-{0}-{1}', needs.compile-application.outputs.artifact-version, github.sha) || '' }}
+          ${{ github.ref_name == 'main' && format('v{0}', needs.compile-application.outputs.artifact-version) || '' }}
+
+    # Display all created tags for visibility
+    - name: Display created image tags
+      run: |
+        echo "🐳 Docker image successfully built and pushed!"
+        echo ""
+        echo "📍 Standard tags:"
+        echo "  - ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}"
+        echo "  - ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ needs.compile-application.outputs.artifact-version }}-${{ github.sha }}"
+        
+        if [ "${{ github.ref_name }}" == "main" ]; then
+          echo ""
+          echo "🏷️ Production-specific tags:"
+          echo "  - ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:prod-${{ needs.compile-application.outputs.artifact-version }}-${{ github.sha }}"
+          echo "  - ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:v${{ needs.compile-application.outputs.artifact-version }}"
+          echo "  - ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+        fi
+
+  # ===============================================
+  # JOB 4: Auto-trigger Environment Deployments
+  # ===============================================
+  # Automatically triggers deployment workflows for staging/production
+  # This creates a seamless CI/CD pipeline
+  auto-deploy:
+    name: Trigger Environment Deployment
+    runs-on: ubuntu-latest
+    needs: containerize
+    # Only trigger for staging and main branch pushes
+    if: |
+      github.event_name == 'push' && 
+      (github.ref == 'refs/heads/staging' || github.ref == 'refs/heads/main')
+    
+    steps:
+    # Trigger the appropriate deployment workflow
+    # Uses the branch name as the image tag (always latest for that branch)
+    - name: Initiate deployment workflow
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const branch = context.ref.replace('refs/heads/', '');
+          const workflow = branch === 'staging' ? '04-deploy-staging.yml' : '05-deploy-production.yml';
+          const imageTag = branch; // Use branch name as tag (gets latest)
+          
+          console.log(`🚀 Triggering ${workflow} with image tag: ${imageTag}`);
+          
+          await github.rest.actions.createWorkflowDispatch({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            workflow_id: workflow,
+            ref: branch,
+            inputs: {
+              'image-tag': imageTag
+            }
+          });
+          
+          console.log('✅ Deployment workflow triggered successfully');
