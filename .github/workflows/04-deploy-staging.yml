@@ -44,7 +44,7 @@ jobs:
   # ===============================================
   deploy-staging:
     name: Staging Deployment
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     environment: staging  # Requires approval if configured
     
     steps:
@@ -72,7 +72,47 @@ jobs:
         echo "🐳 Deploying image: gwynbliedd/book-library:$IMAGE_TAG"
 
     # ===============================================
-    # STEP 2: Validation Deployment (Dry Run)
+    # STEP 2: Wait for Docker Image Availability
+    # ===============================================
+    # When triggered by push, CI and deployment run in parallel
+    # We need to wait for the CI to build and push the image
+    - name: Wait for Docker image
+      if: github.event_name == 'push'
+      run: |
+        echo "⏳ Waiting for CI pipeline to build and push image..."
+        echo "🔍 Checking for image: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }}"
+        
+        # Maximum wait time: 20 minutes (80 attempts with 15 second intervals)
+        MAX_ATTEMPTS=80
+        ATTEMPT=0
+        
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          ATTEMPT=$((ATTEMPT + 1))
+          echo "Attempt $ATTEMPT of $MAX_ATTEMPTS..."
+          
+          # Check if image exists in registry
+          if docker manifest inspect "${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }}" >/dev/null 2>&1; then
+            echo "✅ Image found! Proceeding with deployment."
+            break
+          fi
+          
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "❌ Timeout waiting for image. CI pipeline may have failed."
+            echo "Please check the CI pipeline status."
+            exit 1
+          fi
+          
+          # Wait 15 seconds before next attempt
+          echo "Image not found yet. Waiting 15 seconds..."
+          sleep 15
+        done
+        
+        # Extra wait to ensure image is fully propagated
+        echo "⏳ Waiting additional 10 seconds for registry propagation..."
+        sleep 10
+
+    # ===============================================
+    # STEP 3: Validation Deployment (Dry Run)
     # ===============================================
     # Always perform a dry run first to catch configuration errors
     - name: Validate deployment configuration
@@ -86,7 +126,7 @@ jobs:
         dry-run: 'true'
 
     # ===============================================
-    # STEP 3: Execute Deployment
+    # STEP 4: Execute Deployment
     # ===============================================
     - name: Deploy to staging cluster
       uses: ./.github/actions/helm-deploy
@@ -99,7 +139,7 @@ jobs:
         dry-run: 'false'
 
     # ===============================================
-    # STEP 4: Post-Deployment Verification
+    # STEP 5: Post-Deployment Verification
     # ===============================================
     - name: Run smoke tests
       run: |
@@ -139,7 +179,7 @@ jobs:
         echo "🎉 All smoke tests passed!"
 
     # ===============================================
-    # STEP 5: Record Deployment
+    # STEP 6: Record Deployment
     # ===============================================
     # Create GitHub deployment record for tracking
     - name: Create deployment record
@@ -176,7 +216,7 @@ jobs:
           console.log('✅ Deployment record created');
 
     # ===============================================
-    # STEP 6: Send Notifications
+    # STEP 7: Send Notifications
     # ===============================================
     # Notify team of deployment status (always runs)
     - name: Send Slack notification
@@ -199,7 +239,7 @@ jobs:
         SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
 
     # ===============================================
-    # STEP 7: Output Summary
+    # STEP 8: Output Summary
     # ===============================================
     - name: Deployment summary
       if: success()
